@@ -679,3 +679,258 @@ func TestCancelSupersededBatches(t *testing.T) {
 		t.Errorf("expected 0 canceled on no-op, got %d", len(canceledIDs))
 	}
 }
+
+func TestLatestBatchTimeForPR(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	t.Run("no batches returns zero time", func(t *testing.T) {
+		ts, err := db.LatestBatchTimeForPR(testRepo, 99)
+		if err != nil {
+			t.Fatalf("LatestBatchTimeForPR: %v", err)
+		}
+		if !ts.IsZero() {
+			t.Errorf("expected zero time, got %v", ts)
+		}
+	})
+
+	t.Run("returns latest batch time", func(t *testing.T) {
+		before := time.Now().UTC().Truncate(time.Second)
+
+		repo, err := db.GetOrCreateRepo("/tmp/test-throttle")
+		if err != nil {
+			t.Fatalf("GetOrCreateRepo: %v", err)
+		}
+
+		batchA := mustCreateCIBatch(
+			t, db, testRepo, 42, "sha-a", 1,
+		)
+		jobA := mustEnqueueReviewJob(
+			t, db, repo.ID, "a..b", "codex", "security",
+		)
+		mustRecordBatchJob(t, db, batchA.ID, jobA.ID)
+
+		batchB := mustCreateCIBatch(
+			t, db, testRepo, 42, "sha-b", 1,
+		)
+		jobB := mustEnqueueReviewJob(
+			t, db, repo.ID, "c..d", "codex", "security",
+		)
+		mustRecordBatchJob(t, db, batchB.ID, jobB.ID)
+
+		ts, err := db.LatestBatchTimeForPR(testRepo, 42)
+		if err != nil {
+			t.Fatalf("LatestBatchTimeForPR: %v", err)
+		}
+		if ts.IsZero() {
+			t.Fatal("expected non-zero time")
+		}
+		// The latest batch time should be at or after our "before" marker
+		if ts.Before(before.Add(-1 * time.Second)) {
+			t.Errorf(
+				"expected time >= %v, got %v",
+				before, ts,
+			)
+		}
+	})
+
+	t.Run("different PR returns zero", func(t *testing.T) {
+		ts, err := db.LatestBatchTimeForPR(testRepo, 999)
+		if err != nil {
+			t.Fatalf("LatestBatchTimeForPR: %v", err)
+		}
+		if !ts.IsZero() {
+			t.Errorf("expected zero time for different PR, got %v", ts)
+		}
+	})
+}
+
+func TestGetPendingBatchPRs(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	repo, err := db.GetOrCreateRepo("/tmp/test-pending")
+	if err != nil {
+		t.Fatalf("GetOrCreateRepo: %v", err)
+	}
+
+	// Batch for PR #5 (unsynthesized, unclaimed)
+	batch5 := mustCreateCIBatch(t, db, testRepo, 5, "sha5", 1)
+	job5 := mustEnqueueReviewJob(t, db, repo.ID, "a..b", testAgent, testReview)
+	mustRecordBatchJob(t, db, batch5.ID, job5.ID)
+
+	// Batch for PR #7 (unsynthesized, unclaimed)
+	batch7 := mustCreateCIBatch(t, db, testRepo, 7, "sha7", 1)
+	job7 := mustEnqueueReviewJob(t, db, repo.ID, "c..d", testAgent, testReview)
+	mustRecordBatchJob(t, db, batch7.ID, job7.ID)
+
+	// Batch for PR #9 — synthesized (should NOT appear)
+	batch9 := mustCreateCIBatch(t, db, testRepo, 9, "sha9", 1)
+	job9 := mustEnqueueReviewJob(t, db, repo.ID, "e..f", testAgent, testReview)
+	mustRecordBatchJob(t, db, batch9.ID, job9.ID)
+	if _, err := db.ClaimBatchForSynthesis(batch9.ID); err != nil {
+		t.Fatalf("ClaimBatchForSynthesis: %v", err)
+	}
+
+	// Batch for a different repo (should NOT appear)
+	batchOther := mustCreateCIBatch(t, db, "other/repo", 5, "sha-other", 1)
+	jobOther := mustEnqueueReviewJob(t, db, repo.ID, "g..h", testAgent, testReview)
+	mustRecordBatchJob(t, db, batchOther.ID, jobOther.ID)
+
+	refs, err := db.GetPendingBatchPRs(testRepo)
+	if err != nil {
+		t.Fatalf("GetPendingBatchPRs: %v", err)
+	}
+
+	prNums := make(map[int]bool)
+	for _, r := range refs {
+		prNums[r.PRNumber] = true
+		assertEq(t, "GithubRepo", r.GithubRepo, testRepo)
+	}
+	if !prNums[5] || !prNums[7] {
+		t.Errorf("expected PRs 5 and 7, got %v", prNums)
+	}
+	if prNums[9] {
+		t.Error("synthesized PR #9 should not appear")
+	}
+	if len(refs) != 2 {
+		t.Errorf("expected 2 refs, got %d", len(refs))
+	}
+}
+
+func TestCancelClosedPRBatches(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	repo, err := db.GetOrCreateRepo("/tmp/test-cancel-closed")
+	if err != nil {
+		t.Fatalf("GetOrCreateRepo: %v", err)
+	}
+
+	// Create a batch with 2 queued jobs for PR #5
+	batch := mustCreateCIBatch(t, db, testRepo, 5, "sha5", 2)
+	job1 := mustEnqueueReviewJob(t, db, repo.ID, "a..b", testAgent, testReview)
+	job2 := mustEnqueueReviewJob(t, db, repo.ID, "a..b", "gemini", "review")
+	mustRecordBatchJob(t, db, batch.ID, job1.ID)
+	mustRecordBatchJob(t, db, batch.ID, job2.ID)
+
+	// Create a synthesized batch for PR #5 (should NOT be canceled)
+	doneBatch := mustCreateCIBatch(t, db, testRepo, 5, "sha5-done", 1)
+	doneJob := mustEnqueueReviewJob(t, db, repo.ID, "c..d", testAgent, testReview)
+	mustRecordBatchJob(t, db, doneBatch.ID, doneJob.ID)
+	if _, err := db.ClaimBatchForSynthesis(doneBatch.ID); err != nil {
+		t.Fatalf("ClaimBatchForSynthesis: %v", err)
+	}
+
+	canceledIDs, err := db.CancelClosedPRBatches(testRepo, 5)
+	if err != nil {
+		t.Fatalf("CancelClosedPRBatches: %v", err)
+	}
+	if len(canceledIDs) != 2 {
+		t.Errorf("expected 2 canceled jobs, got %d", len(canceledIDs))
+	}
+
+	// Unsynthesized batch should be deleted
+	var count int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM ci_pr_batches WHERE id = ?`,
+		batch.ID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count deleted batch: %v", err)
+	}
+	assertEq(t, "deleted batch count", count, 0)
+
+	// Jobs should be canceled
+	var status string
+	if err := db.QueryRow(
+		`SELECT status FROM review_jobs WHERE id = ?`, job1.ID,
+	).Scan(&status); err != nil {
+		t.Fatalf("query job1 status: %v", err)
+	}
+	assertEq(t, "job1 status", status, "canceled")
+
+	// Synthesized batch should still exist
+	var doneCount int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM ci_pr_batches WHERE id = ?`,
+		doneBatch.ID,
+	).Scan(&doneCount); err != nil {
+		t.Fatalf("count done batch: %v", err)
+	}
+	assertEq(t, "done batch count", doneCount, 1)
+
+	// No-op when no pending batches
+	canceledIDs, err = db.CancelClosedPRBatches(testRepo, 5)
+	if err != nil {
+		t.Fatalf("CancelClosedPRBatches no-op: %v", err)
+	}
+	if len(canceledIDs) != 0 {
+		t.Errorf("expected 0 canceled on no-op, got %d", len(canceledIDs))
+	}
+}
+
+func TestCancelClosedPRBatches_SkipsClaimedBatch(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	repo, err := db.GetOrCreateRepo("/tmp/test-skip-claimed")
+	if err != nil {
+		t.Fatalf("GetOrCreateRepo: %v", err)
+	}
+
+	// Create a batch and claim it (mid-synthesis)
+	batch := mustCreateCIBatch(t, db, testRepo, 15, "sha15", 1)
+	job := mustEnqueueReviewJob(t, db, repo.ID, "a..b", testAgent, testReview)
+	mustRecordBatchJob(t, db, batch.ID, job.ID)
+
+	// Mark job done so batch is eligible for synthesis
+	if _, err := db.Exec(
+		`UPDATE review_jobs SET status='done' WHERE id = ?`, job.ID,
+	); err != nil {
+		t.Fatalf("mark done: %v", err)
+	}
+
+	// Claim the batch (synthesized=0, claimed_at IS NOT NULL)
+	claimed, err := db.ClaimBatchForSynthesis(batch.ID)
+	if err != nil {
+		t.Fatalf("ClaimBatchForSynthesis: %v", err)
+	}
+	if !claimed {
+		t.Fatal("expected successful claim")
+	}
+
+	// Unclaim to get back to synthesized=0 but claimed_at set
+	// Actually, ClaimBatchForSynthesis sets synthesized=1.
+	// We need synthesized=0, claimed_at IS NOT NULL to test the
+	// race window. Simulate by unclaiming (sets synthesized=0,
+	// claimed_at=NULL) then re-claiming.
+	// Instead, just set claimed_at directly for the test scenario.
+	if _, err := db.Exec(
+		`UPDATE ci_pr_batches SET synthesized = 0, claimed_at = datetime('now') WHERE id = ?`,
+		batch.ID,
+	); err != nil {
+		t.Fatalf("set claimed state: %v", err)
+	}
+
+	// CancelClosedPRBatches should skip this claimed batch
+	canceledIDs, err := db.CancelClosedPRBatches(testRepo, 15)
+	if err != nil {
+		t.Fatalf("CancelClosedPRBatches: %v", err)
+	}
+	if len(canceledIDs) != 0 {
+		t.Errorf(
+			"expected 0 canceled for claimed batch, got %d",
+			len(canceledIDs),
+		)
+	}
+
+	// Batch should still exist
+	var count int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM ci_pr_batches WHERE id = ?`,
+		batch.ID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count batch: %v", err)
+	}
+	assertEq(t, "claimed batch should survive", count, 1)
+}

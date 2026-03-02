@@ -3,7 +3,14 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"time"
 )
+
+// BatchPRRef identifies a (github_repo, pr_number) pair for batch lookups.
+type BatchPRRef struct {
+	GithubRepo string
+	PRNumber   int
+}
 
 // CIPRReview tracks which PRs have been reviewed at which HEAD SHA
 type CIPRReview struct {
@@ -84,6 +91,27 @@ func (db *DB) HasCIBatch(githubRepo string, prNumber int, headSHA string) (bool,
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// LatestBatchTimeForPR returns the created_at timestamp of the most
+// recent batch for the given PR, regardless of HEAD SHA.
+// Returns zero time if no batch exists.
+func (db *DB) LatestBatchTimeForPR(
+	githubRepo string, prNumber int,
+) (time.Time, error) {
+	var ts sql.NullString
+	err := db.QueryRow(`
+		SELECT MAX(b.created_at) FROM ci_pr_batches b
+		WHERE b.github_repo = ? AND b.pr_number = ?
+		AND EXISTS (
+			SELECT 1 FROM ci_pr_batch_jobs bj
+			WHERE bj.batch_id = b.id
+		)`,
+		githubRepo, prNumber).Scan(&ts)
+	if err != nil || !ts.Valid {
+		return time.Time{}, err
+	}
+	return time.Parse("2006-01-02 15:04:05", ts.String)
 }
 
 // CreateCIBatch creates a new batch record for a PR. Uses INSERT OR IGNORE to
@@ -411,6 +439,99 @@ func (db *DB) GetStaleBatches() ([]CIPRBatch, error) {
 		batches = append(batches, b)
 	}
 	return batches, rows.Err()
+}
+
+// GetPendingBatchPRs returns the distinct (github_repo, pr_number)
+// pairs that have unsynthesized, unclaimed batches. This lets the
+// poller cross-reference pending batches against the open PR list
+// without additional GitHub API calls.
+func (db *DB) GetPendingBatchPRs(
+	githubRepo string,
+) ([]BatchPRRef, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT github_repo, pr_number
+		FROM ci_pr_batches
+		WHERE github_repo = ?
+		  AND synthesized = 0
+		  AND claimed_at IS NULL`,
+		githubRepo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var refs []BatchPRRef
+	for rows.Next() {
+		var r BatchPRRef
+		if err := rows.Scan(&r.GithubRepo, &r.PRNumber); err != nil {
+			return nil, err
+		}
+		refs = append(refs, r)
+	}
+	return refs, rows.Err()
+}
+
+// CancelClosedPRBatches cancels unclaimed pending batches (and their
+// linked jobs) for a specific PR. Used when the PR is closed or
+// merged. Skips batches that are currently claimed for synthesis to
+// avoid racing with the posting flow. Returns the IDs of jobs that
+// were canceled.
+func (db *DB) CancelClosedPRBatches(
+	githubRepo string, prNumber int,
+) ([]int64, error) {
+	rows, err := db.Query(`
+		SELECT id FROM ci_pr_batches
+		WHERE github_repo = ? AND pr_number = ?
+		  AND synthesized = 0
+		  AND claimed_at IS NULL`,
+		githubRepo, prNumber)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var batchIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		batchIDs = append(batchIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(batchIDs) == 0 {
+		return nil, nil
+	}
+
+	var canceledIDs []int64
+	for _, batchID := range batchIDs {
+		jobIDs, err := db.GetBatchJobIDs(batchID)
+		if err != nil {
+			return canceledIDs, fmt.Errorf(
+				"get jobs for batch %d: %w", batchID, err,
+			)
+		}
+		for _, jid := range jobIDs {
+			if err := db.CancelJob(jid); err != nil {
+				if err == sql.ErrNoRows {
+					continue
+				}
+				return canceledIDs, fmt.Errorf(
+					"cancel job %d: %w", jid, err,
+				)
+			}
+			canceledIDs = append(canceledIDs, jid)
+		}
+		if err := db.DeleteCIBatch(batchID); err != nil {
+			return canceledIDs, fmt.Errorf(
+				"delete batch %d: %w", batchID, err,
+			)
+		}
+	}
+
+	return canceledIDs, nil
 }
 
 // ReconcileBatch corrects the completed/failed counts for a batch by

@@ -270,12 +270,17 @@ func TestFormatRawBatchComment(t *testing.T) {
 	assertContainsAll(t, comment, "comment",
 		"## roborev: Combined Review (`abc123d`)",
 		"Synthesis unavailable",
-		"<details>",
-		"Agent: codex | Type: security | Status: done",
+		"### codex — security (done)",
 		"Finding A",
-		"Agent: gemini | Type: review | Status: failed",
+		"### gemini — review (failed)",
 		"**Error:** Review failed. Check CI logs for details.",
+		"---",
 	)
+
+	if strings.Contains(comment, "<details>") {
+		t.Error(
+			"raw batch comment should not use <details> blocks")
+	}
 }
 
 func TestFormatSynthesizedComment(t *testing.T) {
@@ -884,6 +889,73 @@ func TestCIPollerSynthesizeBatchResults_UsesRepoPath(t *testing.T) {
 	// Verify the repo's root_path was passed (not empty string).
 	if !strings.Contains(out, "Repo: "+h.RepoPath) {
 		t.Errorf("expected synthesis to run with repoPath=%q, got output: %q", h.RepoPath, out)
+	}
+}
+
+func TestSynthesizeBatchResults_BackupOnPrimaryFailure(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.CI.SynthesisAgent = "nonexistent-primary-xyz"
+	cfg.CI.SynthesisBackupAgent = "test"
+
+	p := &CIPoller{}
+	out, err := p.synthesizeBatchResults(
+		&storage.CIPRBatch{ID: 1, HeadSHA: "deadbeef12345678"},
+		[]storage.BatchReviewResult{
+			{JobID: 1, Agent: "codex", ReviewType: "security", Output: "No issues.", Status: "done"},
+			{JobID: 2, Agent: "gemini", ReviewType: "review", Output: "Bug in x.go:10", Status: "done"},
+		},
+		cfg,
+	)
+	if err != nil {
+		t.Fatalf("expected backup to succeed, got: %v", err)
+	}
+	if !strings.Contains(out, "## roborev: Combined Review") {
+		t.Fatalf("expected combined review header, got: %q", out)
+	}
+}
+
+func TestSynthesizeBatchResults_BothAgentsFail(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.CI.SynthesisAgent = "nonexistent-primary-xyz"
+	cfg.CI.SynthesisBackupAgent = "nonexistent-backup-xyz"
+
+	p := &CIPoller{}
+	_, err := p.synthesizeBatchResults(
+		&storage.CIPRBatch{ID: 1, HeadSHA: "deadbeef12345678"},
+		[]storage.BatchReviewResult{
+			{JobID: 1, Agent: "codex", ReviewType: "security", Output: "No issues.", Status: "done"},
+		},
+		cfg,
+	)
+	if err == nil {
+		t.Fatal("expected error when both agents fail")
+	}
+	if !strings.Contains(err.Error(), "backup") {
+		t.Fatalf("expected error to mention backup, got: %v", err)
+	}
+}
+
+func TestSynthesizeBatchResults_NoBackupConfigured(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.CI.SynthesisAgent = "nonexistent-primary-xyz"
+	// No backup configured (empty string).
+
+	p := &CIPoller{}
+	_, err := p.synthesizeBatchResults(
+		&storage.CIPRBatch{ID: 1, HeadSHA: "deadbeef12345678"},
+		[]storage.BatchReviewResult{
+			{JobID: 1, Agent: "codex", ReviewType: "security", Output: "No issues.", Status: "done"},
+		},
+		cfg,
+	)
+	if err == nil {
+		t.Fatal("expected error when primary fails with no backup")
+	}
+	if !strings.Contains(err.Error(), "primary") {
+		t.Fatalf("expected error to mention primary, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "backup") {
+		t.Fatalf("error should not mention backup when none configured, got: %v", err)
 	}
 }
 
@@ -2310,5 +2382,708 @@ func TestCIPollerPostBatchResults_SetsErrorStatusOnCommentPostFailure(t *testing
 	}
 	if sc.Desc != "Review failed to post" {
 		t.Errorf("desc=%q, want 'Review failed to post'", sc.Desc)
+	}
+}
+
+func TestCIPollerProcessPR_ThrottlesRecentPR(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Cfg.CI.ThrottleInterval = "1h"
+	h.Poller = NewCIPoller(
+		h.DB, NewStaticConfig(h.Cfg), nil,
+	)
+	h.stubProcessPRGit()
+	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) {
+		return "base-sha", nil
+	}
+
+	// First push — should be reviewed (no prior batch)
+	captured := h.CaptureCommitStatuses()
+	err := h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      70,
+			HeadRefOid:  "first-sha",
+			BaseRefName: "main",
+		}, h.Cfg)
+	if err != nil {
+		t.Fatalf("first processPR: %v", err)
+	}
+
+	hasBatch, err := h.DB.HasCIBatch(
+		"acme/api", 70, "first-sha",
+	)
+	if err != nil {
+		t.Fatalf("HasCIBatch: %v", err)
+	}
+	if !hasBatch {
+		t.Fatal("expected batch for first push")
+	}
+
+	// Second push within throttle window — should be
+	// deferred
+	*captured = nil
+	err = h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      70,
+			HeadRefOid:  "second-sha",
+			BaseRefName: "main",
+		}, h.Cfg)
+	if err != nil {
+		t.Fatalf("second processPR: %v", err)
+	}
+
+	hasBatch, err = h.DB.HasCIBatch(
+		"acme/api", 70, "second-sha",
+	)
+	if err != nil {
+		t.Fatalf("HasCIBatch: %v", err)
+	}
+	if hasBatch {
+		t.Fatal(
+			"expected no batch for throttled second push")
+	}
+
+	// Verify pending status was set with deferred message
+	if len(*captured) != 1 {
+		t.Fatalf(
+			"expected 1 status call, got %d",
+			len(*captured))
+	}
+	sc := (*captured)[0]
+	if sc.State != "pending" {
+		t.Errorf("state=%q, want pending", sc.State)
+	}
+	if !strings.Contains(sc.Desc, "Review deferred") {
+		t.Errorf(
+			"desc=%q, want 'Review deferred' substring",
+			sc.Desc)
+	}
+}
+
+func TestCIPollerProcessPR_ThrottleBypassUser(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Cfg.CI.ThrottleInterval = "1h"
+	h.Cfg.CI.ThrottleBypassUsers = []string{"wesm"}
+	h.Poller = NewCIPoller(
+		h.DB, NewStaticConfig(h.Cfg), nil,
+	)
+	h.stubProcessPRGit()
+	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) {
+		return "base-sha", nil
+	}
+
+	// First push — reviewed normally
+	err := h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      80,
+			HeadRefOid:  "first-sha",
+			BaseRefName: "main",
+			Author:      ghPRAuthor{Login: "wesm"},
+		}, h.Cfg)
+	if err != nil {
+		t.Fatalf("first processPR: %v", err)
+	}
+
+	hasBatch, err := h.DB.HasCIBatch(
+		"acme/api", 80, "first-sha",
+	)
+	if err != nil {
+		t.Fatalf("HasCIBatch: %v", err)
+	}
+	if !hasBatch {
+		t.Fatal("expected batch for first push")
+	}
+
+	// Second push within throttle window — bypass user should
+	// still get reviewed immediately
+	err = h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      80,
+			HeadRefOid:  "second-sha",
+			BaseRefName: "main",
+			Author:      ghPRAuthor{Login: "wesm"},
+		}, h.Cfg)
+	if err != nil {
+		t.Fatalf("second processPR: %v", err)
+	}
+
+	hasBatch, err = h.DB.HasCIBatch(
+		"acme/api", 80, "second-sha",
+	)
+	if err != nil {
+		t.Fatalf("HasCIBatch: %v", err)
+	}
+	if !hasBatch {
+		t.Fatal(
+			"expected batch for bypass user's second push")
+	}
+}
+
+func TestCIPollerProcessPR_ThrottleDisabled(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Cfg.CI.ThrottleInterval = "0"
+	h.Poller = NewCIPoller(
+		h.DB, NewStaticConfig(h.Cfg), nil,
+	)
+	h.stubProcessPRGit()
+	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) {
+		return "base-sha", nil
+	}
+
+	// First push
+	err := h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      71,
+			HeadRefOid:  "first-sha",
+			BaseRefName: "main",
+		}, h.Cfg)
+	if err != nil {
+		t.Fatalf("first processPR: %v", err)
+	}
+
+	// Second push — should NOT be throttled
+	err = h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      71,
+			HeadRefOid:  "second-sha",
+			BaseRefName: "main",
+		}, h.Cfg)
+	if err != nil {
+		t.Fatalf("second processPR: %v", err)
+	}
+
+	hasBatch, err := h.DB.HasCIBatch(
+		"acme/api", 71, "second-sha",
+	)
+	if err != nil {
+		t.Fatalf("HasCIBatch: %v", err)
+	}
+	if !hasBatch {
+		t.Fatal(
+			"expected batch for second push " +
+				"when throttle disabled")
+	}
+}
+
+func TestCIPollerProcessPR_ReviewsMapMatrix(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.CI.Reviews = map[string][]string{
+		"codex":  {"security"},
+		"gemini": {"security", "review"},
+	}
+	h.Cfg.CI.ThrottleInterval = "0"
+	h.Poller = NewCIPoller(
+		h.DB, NewStaticConfig(h.Cfg), nil,
+	)
+	h.stubProcessPRGit()
+	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) {
+		return "base-sha", nil
+	}
+
+	err := h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      72,
+			HeadRefOid:  "matrix-sha",
+			BaseRefName: "main",
+		}, h.Cfg)
+	if err != nil {
+		t.Fatalf("processPR: %v", err)
+	}
+
+	jobs, err := h.DB.ListJobs(
+		"", h.RepoPath, 0, 0,
+		storage.WithGitRef("base-sha..matrix-sha"),
+	)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("expected 3 jobs, got %d", len(jobs))
+	}
+
+	got := make(map[string]bool)
+	for _, j := range jobs {
+		got[j.Agent+"|"+j.ReviewType] = true
+	}
+	want := []string{
+		"codex|security",
+		"gemini|security",
+		"gemini|default",
+	}
+	for _, key := range want {
+		if !got[key] {
+			t.Errorf("missing job combination %q", key)
+		}
+	}
+}
+
+func TestCIPollerProcessPR_RepoReviewsMapOverride(
+	t *testing.T,
+) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security", "review"}
+	h.Cfg.CI.Agents = []string{"codex", "gemini"}
+	h.Cfg.CI.ThrottleInterval = "0"
+	h.Poller = NewCIPoller(
+		h.DB, NewStaticConfig(h.Cfg), nil,
+	)
+	h.stubProcessPRGit()
+	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) {
+		return "base-sha", nil
+	}
+
+	// Write repo config with reviews map override
+	repoConfig := "[ci]\n" +
+		"[ci.reviews]\n" +
+		"codex = [\"security\"]\n"
+	if err := os.WriteFile(
+		filepath.Join(h.RepoPath, ".roborev.toml"),
+		[]byte(repoConfig), 0644,
+	); err != nil {
+		t.Fatalf("write .roborev.toml: %v", err)
+	}
+
+	err := h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      73,
+			HeadRefOid:  "repo-matrix-sha",
+			BaseRefName: "main",
+		}, h.Cfg)
+	if err != nil {
+		t.Fatalf("processPR: %v", err)
+	}
+
+	jobs, err := h.DB.ListJobs(
+		"", h.RepoPath, 0, 0,
+		storage.WithGitRef("base-sha..repo-matrix-sha"),
+	)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	// Repo reviews map: codex→[security] only
+	if len(jobs) != 1 {
+		t.Fatalf(
+			"expected 1 job (repo reviews override), "+
+				"got %d", len(jobs))
+	}
+	j := jobs[0]
+	if j.Agent != "codex" {
+		t.Errorf("agent=%q, want codex", j.Agent)
+	}
+	if j.ReviewType != "security" {
+		t.Errorf(
+			"review_type=%q, want security",
+			j.ReviewType)
+	}
+}
+
+func TestCIPollerProcessPR_RepoEmptyReviewsDisables(
+	t *testing.T,
+) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	// Global config has reviews
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Cfg.CI.ThrottleInterval = "0"
+	h.Poller = NewCIPoller(
+		h.DB, NewStaticConfig(h.Cfg), nil,
+	)
+	h.stubProcessPRGit()
+	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) {
+		return "base-sha", nil
+	}
+
+	// Repo config with empty [ci.reviews] disables reviews
+	repoConfig := "[ci]\n" +
+		"[ci.reviews]\n"
+	if err := os.WriteFile(
+		filepath.Join(h.RepoPath, ".roborev.toml"),
+		[]byte(repoConfig), 0644,
+	); err != nil {
+		t.Fatalf("write .roborev.toml: %v", err)
+	}
+
+	err := h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      74,
+			HeadRefOid:  "empty-reviews-sha",
+			BaseRefName: "main",
+		}, h.Cfg)
+	if err != nil {
+		t.Fatalf("processPR: %v", err)
+	}
+
+	// No batch should have been created (repo disabled reviews)
+	hasBatch, err := h.DB.HasCIBatch(
+		"acme/api", 74, "empty-reviews-sha",
+	)
+	if err != nil {
+		t.Fatalf("HasCIBatch: %v", err)
+	}
+	if hasBatch {
+		t.Fatal(
+			"expected no batch when repo disables reviews " +
+				"via empty [ci.reviews]",
+		)
+	}
+}
+
+func TestCIPollerPollRepo_CancelsClosedPRBatches(t *testing.T) {
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Poller = NewCIPoller(h.DB, NewStaticConfig(h.Cfg), nil)
+	h.stubProcessPRGit()
+
+	// Seed a batch for PR #5 (will be closed)
+	batch5, _ := h.seedBatchJob(t, "acme/api", 5, "sha5", "a..b", "codex", "security")
+
+	// Seed a batch for PR #3 (will be open)
+	batch3, _ := h.seedBatchJob(t, "acme/api", 3, "sha3", "c..d", "codex", "security")
+
+	// Only PR #3 is open
+	h.Poller.listOpenPRsFn = func(context.Context, string) ([]ghPR, error) {
+		return []ghPR{
+			{Number: 3, HeadRefOid: "sha3", BaseRefName: "main"},
+		}, nil
+	}
+
+	// Confirm PR #5 is actually closed before canceling
+	h.Poller.isPROpenFn = func(_ string, pr int) bool {
+		return pr != 5
+	}
+
+	var canceledJobs []int64
+	h.Poller.jobCancelFn = func(jobID int64) {
+		canceledJobs = append(canceledJobs, jobID)
+	}
+
+	if err := h.Poller.pollRepo(context.Background(), "acme/api", h.Cfg); err != nil {
+		t.Fatalf("pollRepo: %v", err)
+	}
+
+	// Batch for closed PR #5 should be deleted
+	var count int
+	if err := h.DB.QueryRow(
+		`SELECT COUNT(*) FROM ci_pr_batches WHERE id = ?`,
+		batch5.ID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count batch5: %v", err)
+	}
+	if count != 0 {
+		t.Error("batch for closed PR #5 should have been deleted")
+	}
+
+	// jobCancelFn should have been called
+	if len(canceledJobs) != 1 {
+		t.Errorf("expected 1 job canceled, got %d", len(canceledJobs))
+	}
+
+	// Batch for open PR #3 should still exist
+	has, err := h.DB.HasCIBatch("acme/api", 3, "sha3")
+	if err != nil {
+		t.Fatalf("HasCIBatch: %v", err)
+	}
+	if !has {
+		t.Error("batch for open PR #3 should still exist")
+	}
+
+	_ = batch3 // used for setup
+}
+
+func TestCIPollerPostBatchResults_SkipsClosedPR(t *testing.T) {
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+
+	batch, _ := h.seedBatchWithJobs(t, 10, "head-sha",
+		jobSpec{Agent: "codex", ReviewType: "security", Status: "done", Output: "finding"},
+	)
+
+	// PR is closed
+	h.Poller.isPROpenFn = func(string, int) bool { return false }
+	captured := h.CaptureComments()
+
+	h.Poller.postBatchResults(batch)
+
+	// No comment should have been posted
+	if len(*captured) != 0 {
+		t.Errorf("expected no comments, got %d", len(*captured))
+	}
+
+	// Batch should be finalized (synthesized=1, claimed_at=NULL)
+	h.AssertBatchState(t, batch.ID, 1, false)
+}
+
+func TestCIPollerPostBatchResults_PostsOpenPR(t *testing.T) {
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+
+	batch, _ := h.seedBatchWithJobs(t, 11, "head-sha",
+		jobSpec{Agent: "codex", ReviewType: "security", Status: "done", Output: "finding"},
+	)
+
+	// PR is open
+	h.Poller.isPROpenFn = func(string, int) bool { return true }
+	captured := h.CaptureComments()
+	h.CaptureCommitStatuses()
+
+	h.Poller.postBatchResults(batch)
+
+	// Comment should have been posted
+	if len(*captured) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(*captured))
+	}
+	if (*captured)[0].PR != 11 {
+		t.Errorf("comment PR=%d, want 11", (*captured)[0].PR)
+	}
+
+	// Batch should be finalized normally
+	h.AssertBatchState(t, batch.ID, 1, false)
+}
+
+func TestCIPollerPollRepo_SkipsCancelWhenPRStillOpen(t *testing.T) {
+	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Poller = NewCIPoller(h.DB, NewStaticConfig(h.Cfg), nil)
+	h.stubProcessPRGit()
+
+	// Seed a batch for PR #99 (not returned by list, but still open)
+	batch99, _ := h.seedBatchJob(
+		t, "acme/api", 99, "sha99", "a..b", "codex", "security",
+	)
+
+	// gh pr list returns empty (simulates >100 PR truncation)
+	h.Poller.listOpenPRsFn = func(context.Context, string) ([]ghPR, error) {
+		return nil, nil
+	}
+
+	// isPROpen confirms PR #99 is still open
+	h.Poller.isPROpenFn = func(_ string, pr int) bool {
+		return pr == 99
+	}
+
+	var canceledJobs []int64
+	h.Poller.jobCancelFn = func(jobID int64) {
+		canceledJobs = append(canceledJobs, jobID)
+	}
+
+	if err := h.Poller.pollRepo(
+		context.Background(), "acme/api", h.Cfg,
+	); err != nil {
+		t.Fatalf("pollRepo: %v", err)
+	}
+
+	// Batch should NOT have been canceled
+	has, err := h.DB.HasCIBatch("acme/api", 99, "sha99")
+	if err != nil {
+		t.Fatalf("HasCIBatch: %v", err)
+	}
+	if !has {
+		t.Error(
+			"batch for still-open PR #99 should not be canceled",
+		)
+	}
+	if len(canceledJobs) != 0 {
+		t.Errorf(
+			"expected 0 jobs canceled, got %d", len(canceledJobs),
+		)
+	}
+
+	_ = batch99
+}
+
+func TestCIPollerProcessPR_EmptyMatrixSkipsBatch(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	// Configure reviews map with all empty lists → empty matrix
+	h.Cfg.CI.Reviews = map[string][]string{
+		"codex": {},
+	}
+	h.Cfg.CI.ThrottleInterval = "0"
+	h.Poller = NewCIPoller(
+		h.DB, NewStaticConfig(h.Cfg), nil,
+	)
+	h.stubProcessPRGit()
+	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) {
+		return "base-sha", nil
+	}
+
+	err := h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      90,
+			HeadRefOid:  "head-sha",
+			BaseRefName: "main",
+		}, h.Cfg)
+	if err != nil {
+		t.Fatalf("processPR: %v", err)
+	}
+
+	// No batch should have been created
+	hasBatch, err := h.DB.HasCIBatch("acme/api", 90, "head-sha")
+	if err != nil {
+		t.Fatalf("HasCIBatch: %v", err)
+	}
+	if hasBatch {
+		t.Fatal("expected no batch for empty review matrix")
+	}
+}
+
+func TestCIPollerProcessPR_EmptyMatrixStillCancelsSuperseded(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+
+	// Start with a real matrix so the first push creates a batch
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Cfg.CI.ThrottleInterval = "0"
+	h.Poller = NewCIPoller(
+		h.DB, NewStaticConfig(h.Cfg), nil,
+	)
+	h.stubProcessPRGit()
+	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) {
+		return "base-sha", nil
+	}
+
+	// First push creates a batch with a real job
+	err := h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      95,
+			HeadRefOid:  "old-sha",
+			BaseRefName: "main",
+		}, h.Cfg)
+	if err != nil {
+		t.Fatalf("first processPR: %v", err)
+	}
+
+	hasBatch, err := h.DB.HasCIBatch("acme/api", 95, "old-sha")
+	if err != nil {
+		t.Fatalf("HasCIBatch: %v", err)
+	}
+	if !hasBatch {
+		t.Fatal("expected batch for first push")
+	}
+
+	// Now switch to empty matrix (config change removes all reviews)
+	h.Cfg.CI.Reviews = map[string][]string{"codex": {}}
+	h.Cfg.CI.Agents = nil
+	h.Cfg.CI.ReviewTypes = nil
+	h.Poller = NewCIPoller(
+		h.DB, NewStaticConfig(h.Cfg), nil,
+	)
+	h.stubProcessPRGit()
+	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) {
+		return "base-sha-2", nil
+	}
+
+	var canceledJobs []int64
+	h.Poller.jobCancelFn = func(jobID int64) {
+		canceledJobs = append(canceledJobs, jobID)
+	}
+
+	// Second push with empty matrix — should cancel superseded
+	// batch but not create a new one
+	err = h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      95,
+			HeadRefOid:  "new-sha",
+			BaseRefName: "main",
+		}, h.Cfg)
+	if err != nil {
+		t.Fatalf("second processPR: %v", err)
+	}
+
+	// Old batch should have been canceled
+	if len(canceledJobs) != 1 {
+		t.Errorf(
+			"expected 1 superseded job canceled, got %d",
+			len(canceledJobs),
+		)
+	}
+
+	// No new batch should have been created
+	hasBatch, err = h.DB.HasCIBatch("acme/api", 95, "new-sha")
+	if err != nil {
+		t.Fatalf("HasCIBatch: %v", err)
+	}
+	if hasBatch {
+		t.Fatal(
+			"expected no batch for empty matrix after supersede",
+		)
+	}
+}
+
+func TestCIPollerProcessPR_AgentFailureSetsErrorStatus(t *testing.T) {
+	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
+	h.Cfg.CI.ReviewTypes = []string{"security"}
+	h.Cfg.CI.Agents = []string{"codex"}
+	h.Cfg.CI.ThrottleInterval = "0"
+	h.Poller = NewCIPoller(
+		h.DB, NewStaticConfig(h.Cfg), nil,
+	)
+	h.stubProcessPRGit()
+	h.Poller.mergeBaseFn = func(_, _, _ string) (string, error) {
+		return "base-sha", nil
+	}
+
+	// Agent resolution always fails (simulates quota/unavailable)
+	h.Poller.agentResolverFn = func(string) (string, error) {
+		return "", errors.New("agent quota exceeded")
+	}
+
+	statuses := h.CaptureCommitStatuses()
+
+	err := h.Poller.processPR(
+		context.Background(), "acme/api",
+		ghPR{
+			Number:      91,
+			HeadRefOid:  "head-sha-91",
+			BaseRefName: "main",
+		}, h.Cfg)
+	if err == nil {
+		t.Fatal("expected error from processPR")
+	}
+
+	// No batch should remain (rolled back)
+	hasBatch, dbErr := h.DB.HasCIBatch(
+		"acme/api", 91, "head-sha-91",
+	)
+	if dbErr != nil {
+		t.Fatalf("HasCIBatch: %v", dbErr)
+	}
+	if hasBatch {
+		t.Fatal("expected batch to be rolled back")
+	}
+
+	// Error commit status should have been set
+	if len(*statuses) != 1 {
+		t.Fatalf(
+			"expected 1 status call, got %d", len(*statuses),
+		)
+	}
+	sc := (*statuses)[0]
+	if sc.State != "error" {
+		t.Errorf("state=%q, want error", sc.State)
+	}
+	if sc.SHA != "head-sha-91" {
+		t.Errorf("SHA=%q, want head-sha-91", sc.SHA)
+	}
+	if !strings.Contains(sc.Desc, "agent") {
+		t.Errorf(
+			"desc=%q, want substring 'agent'", sc.Desc,
+		)
 	}
 }

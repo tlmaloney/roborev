@@ -28,13 +28,19 @@ import (
 // repo matches the given GitHub "owner/repo" identifier.
 var errLocalRepoNotFound = errors.New("no local repo found")
 
+// ghPRAuthor represents the author of a GitHub pull request.
+type ghPRAuthor struct {
+	Login string `json:"login"`
+}
+
 // ghPR represents a GitHub pull request from `gh pr list --json`
 type ghPR struct {
-	Number      int    `json:"number"`
-	HeadRefOid  string `json:"headRefOid"`
-	BaseRefName string `json:"baseRefName"`
-	HeadRefName string `json:"headRefName"`
-	Title       string `json:"title"`
+	Number      int        `json:"number"`
+	HeadRefOid  string     `json:"headRefOid"`
+	BaseRefName string     `json:"baseRefName"`
+	HeadRefName string     `json:"headRefName"`
+	Title       string     `json:"title"`
+	Author      ghPRAuthor `json:"author"`
 }
 
 // CIPoller polls GitHub for open PRs and enqueues security reviews.
@@ -55,8 +61,9 @@ type CIPoller struct {
 	postPRCommentFn   func(string, int, string) error
 	setCommitStatusFn func(ghRepo, sha, state, description string) error
 	synthesizeFn      func(*storage.CIPRBatch, []storage.BatchReviewResult, *config.Config) (string, error)
-	agentResolverFn   func(name string) (string, error) // returns resolved agent name
-	jobCancelFn       func(jobID int64)                 // kills running worker process (optional)
+	agentResolverFn   func(name string) (string, error)      // returns resolved agent name
+	jobCancelFn       func(jobID int64)                      // kills running worker process (optional)
+	isPROpenFn        func(ghRepo string, prNumber int) bool // checks if a PR is still open
 
 	repoResolver *RepoResolver
 
@@ -232,6 +239,44 @@ func (p *CIPoller) pollRepo(ctx context.Context, ghRepo string, cfg *config.Conf
 		return fmt.Errorf("list PRs: %w", err)
 	}
 
+	// Cancel batches for PRs that are no longer open
+	openPRs := make(map[int]bool, len(prs))
+	for _, pr := range prs {
+		openPRs[pr.Number] = true
+	}
+	pendingRefs, err := p.db.GetPendingBatchPRs(ghRepo)
+	if err != nil {
+		log.Printf("CI poller: error getting pending batch PRs for %s: %v", ghRepo, err)
+	} else {
+		for _, ref := range pendingRefs {
+			if openPRs[ref.PRNumber] {
+				continue
+			}
+			// The PR is missing from gh pr list, which may be
+			// truncated at 100 results. Verify it's actually
+			// closed before canceling work.
+			if p.callIsPROpen(ctx, ghRepo, ref.PRNumber) {
+				continue
+			}
+			canceledIDs, cancelErr := p.db.CancelClosedPRBatches(
+				ghRepo, ref.PRNumber,
+			)
+			if len(canceledIDs) > 0 {
+				log.Printf("CI poller: canceled %d jobs for closed PR %s#%d",
+					len(canceledIDs), ghRepo, ref.PRNumber)
+				if p.jobCancelFn != nil {
+					for _, jid := range canceledIDs {
+						p.jobCancelFn(jid)
+					}
+				}
+			}
+			if cancelErr != nil {
+				log.Printf("CI poller: error canceling closed-PR batches for %s#%d: %v",
+					ghRepo, ref.PRNumber, cancelErr)
+			}
+		}
+	}
+
 	for _, pr := range prs {
 		if err := p.processPR(ctx, ghRepo, pr, cfg); err != nil {
 			log.Printf("CI poller: error processing %s#%d: %v", ghRepo, pr.Number, err)
@@ -257,6 +302,35 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 	}
 	if reviewed {
 		return nil
+	}
+
+	// Throttle: skip if this PR was reviewed recently (any SHA).
+	// Bypass users are never throttled.
+	throttle := cfg.CI.ResolvedThrottleInterval()
+	if throttle > 0 && !cfg.CI.IsThrottleBypassed(pr.Author.Login) {
+		lastReview, err := p.db.LatestBatchTimeForPR(
+			ghRepo, pr.Number,
+		)
+		if err != nil {
+			return fmt.Errorf("check PR throttle: %w", err)
+		}
+		if !lastReview.IsZero() &&
+			time.Since(lastReview) < throttle {
+			nextReview := lastReview.Add(throttle)
+			desc := fmt.Sprintf(
+				"Review deferred — next eligible at %s",
+				nextReview.UTC().Format("15:04 UTC"),
+			)
+			if err := p.callSetCommitStatus(
+				ghRepo, pr.HeadRefOid, "pending", desc,
+			); err != nil {
+				log.Printf(
+					"CI poller: failed to set throttle status: %v",
+					err,
+				)
+			}
+			return nil
+		}
 	}
 
 	// Find local repo matching this GitHub repo (auto-clones if needed)
@@ -285,10 +359,9 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 	// Build git ref for range review
 	gitRef := mergeBase + ".." + pr.HeadRefOid
 
-	// Resolve review types, agents, and reasoning from config.
+	// Resolve review matrix and reasoning from config.
 	// Per-repo CI overrides take priority over global CI config.
-	reviewTypes := cfg.CI.ResolvedReviewTypes()
-	agents := cfg.CI.ResolvedAgents()
+	matrix := cfg.CI.ResolvedReviewMatrix()
 	reasoning := "thorough"
 
 	repoCfg, repoCfgErr := loadCIRepoConfig(repo.RootPath)
@@ -296,11 +369,32 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 		log.Printf("CI poller: warning: failed to load repo config for %s: %v", ghRepo, repoCfgErr)
 	}
 	if repoCfg != nil {
-		if len(repoCfg.CI.ReviewTypes) > 0 {
-			reviewTypes = repoCfg.CI.ReviewTypes
-		}
-		if len(repoCfg.CI.Agents) > 0 {
-			agents = repoCfg.CI.Agents
+		if repoMatrix := repoCfg.CI.ResolvedReviewMatrix(); repoMatrix != nil {
+			// Repo [ci.reviews] is authoritative — even an empty
+			// matrix means "disable reviews for this repo".
+			matrix = repoMatrix
+		} else if len(repoCfg.CI.Agents) > 0 || len(repoCfg.CI.ReviewTypes) > 0 {
+			// Fall back to flat overrides for agents/review_types
+			reviewTypes := cfg.CI.ResolvedReviewTypes()
+			agents := cfg.CI.ResolvedAgents()
+			if len(repoCfg.CI.ReviewTypes) > 0 {
+				reviewTypes = repoCfg.CI.ReviewTypes
+			}
+			if len(repoCfg.CI.Agents) > 0 {
+				agents = repoCfg.CI.Agents
+			}
+			matrix = make(
+				[]config.AgentReviewType,
+				0, len(reviewTypes)*len(agents),
+			)
+			for _, rt := range reviewTypes {
+				for _, ag := range agents {
+					matrix = append(matrix, config.AgentReviewType{
+						Agent:      ag,
+						ReviewType: rt,
+					})
+				}
+			}
 		}
 		if strings.TrimSpace(repoCfg.CI.Reasoning) != "" {
 			if r, err := config.NormalizeReasoning(repoCfg.CI.Reasoning); err == nil && r != "" {
@@ -311,15 +405,49 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 		}
 	}
 
-	reviewTypes, err = config.ValidateReviewTypes(reviewTypes)
-	if err != nil {
+	// Canonicalize review types (e.g. "review" → "default")
+	// and deduplicate entries that collapse to the same pair.
+	{
+		seen := make(map[string]bool, len(matrix))
+		canonical := matrix[:0]
+		for _, m := range matrix {
+			rt := m.ReviewType
+			if rt != "" && config.IsDefaultReviewType(rt) {
+				rt = config.ReviewTypeDefault
+			}
+			key := m.Agent + "|" + rt
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			canonical = append(
+				canonical,
+				config.AgentReviewType{
+					Agent:      m.Agent,
+					ReviewType: rt,
+				},
+			)
+		}
+		matrix = canonical
+	}
+
+	// Validate review types in the matrix
+	rtSet := make(map[string]bool, len(matrix))
+	for _, m := range matrix {
+		rtSet[m.ReviewType] = true
+	}
+	rtList := make([]string, 0, len(rtSet))
+	for rt := range rtSet {
+		rtList = append(rtList, rt)
+	}
+	if _, err = config.ValidateReviewTypes(rtList); err != nil {
 		return err
 	}
 
-	totalJobs := len(reviewTypes) * len(agents)
-
 	// Cancel any in-progress batches for this PR at an older HEAD SHA.
 	// When a PR gets a new push, work on the old HEAD is wasted.
+	// This runs before the empty-matrix guard so superseded work is
+	// always cleaned up, even when config changes remove all reviews.
 	if canceledIDs, err := p.db.CancelSupersededBatches(ghRepo, pr.Number, pr.HeadRefOid); err != nil {
 		log.Printf("CI poller: error canceling superseded batches for %s#%d: %v", ghRepo, pr.Number, err)
 	} else if len(canceledIDs) > 0 {
@@ -333,6 +461,16 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 			}
 		}
 	}
+
+	if len(matrix) == 0 {
+		log.Printf(
+			"CI poller: empty review matrix for %s#%d, skipping",
+			ghRepo, pr.Number,
+		)
+		return nil
+	}
+
+	totalJobs := len(matrix)
 
 	// Create batch — only the creator proceeds to enqueue (prevents race)
 	batch, created, err := p.db.CreateCIBatch(ghRepo, pr.Number, pr.HeadRefOid, totalJobs)
@@ -392,11 +530,12 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 		}
 	}
 
-	// Enqueue jobs for each review_type x agent combination.
+	// Enqueue jobs for each entry in the review matrix.
 	// If any enqueue fails, cancel already-created jobs and delete the batch
-	// so the next poll can retry cleanly.
+	// so the next poll can retry cleanly. Sets an error commit status so the
+	// PR author knows the review didn't start.
 	var createdJobIDs []int64
-	rollback := func() {
+	rollback := func(reason string) {
 		for _, jid := range createdJobIDs {
 			if err := p.db.CancelJob(jid); err != nil {
 				log.Printf("CI poller: failed to cancel orphan job %d: %v", jid, err)
@@ -405,57 +544,63 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 		if err := p.db.DeleteCIBatch(batch.ID); err != nil {
 			log.Printf("CI poller: failed to clean up batch %d: %v", batch.ID, err)
 		}
+		if err := p.callSetCommitStatus(
+			ghRepo, pr.HeadRefOid, "error", reason,
+		); err != nil {
+			log.Printf("CI poller: failed to set error status: %v", err)
+		}
 	}
 
-	for _, rt := range reviewTypes {
+	for _, entry := range matrix {
+		rt := entry.ReviewType
+		ag := entry.Agent
+
 		// Map review_type to workflow name (same as handleEnqueue).
 		workflow := "review"
 		if !config.IsDefaultReviewType(rt) {
 			workflow = rt
 		}
 
-		for _, ag := range agents {
-			// Resolve agent through workflow config when not explicitly set
-			resolvedAgent := config.ResolveAgentForWorkflow(ag, repo.RootPath, cfg, workflow, reasoning)
-			if p.agentResolverFn != nil {
-				name, err := p.agentResolverFn(resolvedAgent)
-				if err != nil {
-					rollback()
-					return fmt.Errorf("no review agent available for type=%s: %w", rt, err)
-				}
-				resolvedAgent = name
-			} else if resolved, err := agent.GetAvailableWithConfig(resolvedAgent, cfg); err != nil {
-				rollback()
-				return fmt.Errorf("no review agent available for type=%s: %w", rt, err)
-			} else {
-				resolvedAgent = resolved.Name()
-			}
-
-			// Resolve model through workflow config
-			resolvedModel := config.ResolveModelForWorkflow(cfg.CI.Model, repo.RootPath, cfg, workflow, reasoning)
-
-			job, err := p.db.EnqueueJob(storage.EnqueueOpts{
-				RepoID:     repo.ID,
-				GitRef:     gitRef,
-				Agent:      resolvedAgent,
-				Model:      resolvedModel,
-				Reasoning:  reasoning,
-				ReviewType: rt,
-			})
+		// Resolve agent through workflow config when not explicitly set
+		resolvedAgent := config.ResolveAgentForWorkflow(ag, repo.RootPath, cfg, workflow, reasoning)
+		if p.agentResolverFn != nil {
+			name, err := p.agentResolverFn(resolvedAgent)
 			if err != nil {
-				rollback()
-				return fmt.Errorf("enqueue job (type=%s, agent=%s): %w", rt, resolvedAgent, err)
+				rollback("No agent available — check agent config or quota")
+				return fmt.Errorf("no review agent available for type=%s: %w", rt, err)
 			}
-			createdJobIDs = append(createdJobIDs, job.ID)
-
-			if err := p.db.RecordBatchJob(batch.ID, job.ID); err != nil {
-				rollback()
-				return fmt.Errorf("record batch job: %w", err)
-			}
-
-			log.Printf("CI poller: enqueued job %d for %s#%d (type=%s, agent=%s, range=%s)",
-				job.ID, ghRepo, pr.Number, rt, resolvedAgent, gitRef)
+			resolvedAgent = name
+		} else if resolved, err := agent.GetAvailableWithConfig(resolvedAgent, cfg); err != nil {
+			rollback("No agent available — check agent config or quota")
+			return fmt.Errorf("no review agent available for type=%s: %w", rt, err)
+		} else {
+			resolvedAgent = resolved.Name()
 		}
+
+		// Resolve model through workflow config
+		resolvedModel := config.ResolveModelForWorkflow(cfg.CI.Model, repo.RootPath, cfg, workflow, reasoning)
+
+		job, err := p.db.EnqueueJob(storage.EnqueueOpts{
+			RepoID:     repo.ID,
+			GitRef:     gitRef,
+			Agent:      resolvedAgent,
+			Model:      resolvedModel,
+			Reasoning:  reasoning,
+			ReviewType: rt,
+		})
+		if err != nil {
+			rollback("Review enqueue failed")
+			return fmt.Errorf("enqueue job (type=%s, agent=%s): %w", rt, resolvedAgent, err)
+		}
+		createdJobIDs = append(createdJobIDs, job.ID)
+
+		if err := p.db.RecordBatchJob(batch.ID, job.ID); err != nil {
+			rollback("Review enqueue failed")
+			return fmt.Errorf("record batch job: %w", err)
+		}
+
+		log.Printf("CI poller: enqueued job %d for %s#%d (type=%s, agent=%s, range=%s)",
+			job.ID, ghRepo, pr.Number, rt, resolvedAgent, gitRef)
 	}
 
 	headShort := gitpkg.ShortSHA(pr.HeadRefOid)
@@ -829,7 +974,7 @@ func (p *CIPoller) ghEnvForRepo(ghRepo string) []string {
 func (p *CIPoller) listOpenPRs(ctx context.Context, ghRepo string) ([]ghPR, error) {
 	cmd := exec.CommandContext(ctx, "gh", "pr", "list",
 		"--repo", ghRepo,
-		"--json", "number,headRefOid,baseRefName,headRefName,title",
+		"--json", "number,headRefOid,baseRefName,headRefName,title,author",
 		"--state", "open",
 		"--limit", "100",
 	)
@@ -1041,6 +1186,17 @@ func (p *CIPoller) postBatchResults(batch *storage.CIPRBatch) {
 		return
 	}
 
+	// Check if the target PR is still open. If closed/merged, finalize
+	// the batch (mark done) instead of posting and retrying forever.
+	if !p.callIsPROpen(context.Background(), batch.GithubRepo, batch.PRNumber) {
+		log.Printf("CI poller: PR %s#%d is closed/merged, abandoning batch %d",
+			batch.GithubRepo, batch.PRNumber, batch.ID)
+		if err := p.db.FinalizeBatch(batch.ID); err != nil {
+			log.Printf("CI poller: error finalizing batch %d: %v", batch.ID, err)
+		}
+		return
+	}
+
 	reviews, err := p.db.GetBatchReviews(batch.ID)
 	if err != nil {
 		log.Printf("CI poller: error getting batch reviews for batch %d: %v", batch.ID, err)
@@ -1217,38 +1373,88 @@ func resolveMinSeverity(globalMinSeverity, repoPath, ghRepo string) string {
 	return ""
 }
 
-// synthesizeBatchResults uses an LLM agent to combine multiple review outputs.
-func (p *CIPoller) synthesizeBatchResults(batch *storage.CIPRBatch, reviews []storage.BatchReviewResult, cfg *config.Config) (string, error) {
-	synthesisAgent, err := agent.GetAvailableWithConfig(cfg.CI.SynthesisAgent, cfg)
+// runSynthesisAgent resolves the named agent, applies the model
+// override, and runs the synthesis prompt with a 5-minute timeout.
+func runSynthesisAgent(
+	agentName, model, repoPath, prompt string,
+	cfg *config.Config,
+) (string, error) {
+	a, err := agent.GetAvailableWithConfig(agentName, cfg)
 	if err != nil {
-		return "", fmt.Errorf("get synthesis agent: %w", err)
+		return "", fmt.Errorf("get agent %q: %w", agentName, err)
 	}
-
-	if cfg.CI.SynthesisModel != "" {
-		synthesisAgent = synthesisAgent.WithModel(cfg.CI.SynthesisModel)
+	if model != "" {
+		a = a.WithModel(model)
 	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(), 5*time.Minute,
+	)
+	defer cancel()
+	return a.Review(ctx, repoPath, "", prompt, nil)
+}
 
-	// Resolve repo for per-repo overrides and as the working directory
-	// for the synthesis agent (agents like codex require a git repo).
+// synthesizeBatchResults uses an LLM agent to combine multiple
+// review outputs. If the primary synthesis agent fails and a
+// backup is configured, it retries with the backup before
+// returning an error.
+func (p *CIPoller) synthesizeBatchResults(
+	batch *storage.CIPRBatch,
+	reviews []storage.BatchReviewResult,
+	cfg *config.Config,
+) (string, error) {
+	// Resolve repo for per-repo overrides and as the working
+	// directory for the synthesis agent.
 	var repoPath string
 	if repo := p.resolveRepoForBatch(batch); repo != nil {
 		repoPath = repo.RootPath
 	}
 
-	minSeverity := resolveMinSeverity(cfg.CI.MinSeverity, repoPath, batch.GithubRepo)
-	prompt := reviewpkg.BuildSynthesisPrompt(toReviewResults(reviews), minSeverity)
+	minSeverity := resolveMinSeverity(
+		cfg.CI.MinSeverity, repoPath, batch.GithubRepo,
+	)
+	results := toReviewResults(reviews)
+	prompt := reviewpkg.BuildSynthesisPrompt(
+		results, minSeverity,
+	)
 
-	// Run synthesis from the repo's checkout directory so agents that
-	// require a git working tree (e.g. codex) don't fail.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	model := cfg.CI.SynthesisModel
 
-	output, err := synthesisAgent.Review(ctx, repoPath, "", prompt, nil)
-	if err != nil {
-		return "", fmt.Errorf("synthesis review: %w", err)
+	// Try primary synthesis agent.
+	output, err := runSynthesisAgent(
+		cfg.CI.SynthesisAgent, model, repoPath, prompt, cfg,
+	)
+	if err == nil {
+		return reviewpkg.FormatSynthesizedComment(
+			output, results, batch.HeadSHA,
+		), nil
 	}
 
-	return reviewpkg.FormatSynthesizedComment(output, toReviewResults(reviews), batch.HeadSHA), nil
+	primaryErr := err
+	backup := cfg.CI.SynthesisBackupAgent
+	if backup == "" {
+		return "", fmt.Errorf(
+			"primary synthesis failed: %w", primaryErr,
+		)
+	}
+
+	log.Printf(
+		"CI poller: primary synthesis agent failed: %v, "+
+			"trying backup %q", primaryErr, backup,
+	)
+
+	output, err = runSynthesisAgent(
+		backup, model, repoPath, prompt, cfg,
+	)
+	if err != nil {
+		return "", fmt.Errorf(
+			"backup synthesis failed (%w) after primary "+
+				"failed (%v)", err, primaryErr,
+		)
+	}
+
+	return reviewpkg.FormatSynthesizedComment(
+		output, results, batch.HeadSHA,
+	), nil
 }
 
 func (p *CIPoller) callListOpenPRs(ctx context.Context, ghRepo string) ([]ghPR, error) {
@@ -1298,6 +1504,43 @@ func (p *CIPoller) callSetCommitStatus(ghRepo, sha, state, description string) e
 		return p.setCommitStatusFn(ghRepo, sha, state, description)
 	}
 	return p.setCommitStatus(ghRepo, sha, state, description)
+}
+
+// callIsPROpen checks whether a PR is still open. Uses the test seam
+// if set, otherwise calls isPROpen.
+func (p *CIPoller) callIsPROpen(
+	ctx context.Context, ghRepo string, prNumber int,
+) bool {
+	if p.isPROpenFn != nil {
+		return p.isPROpenFn(ghRepo, prNumber)
+	}
+	return p.isPROpen(ctx, ghRepo, prNumber)
+}
+
+// isPROpen checks whether a GitHub PR is still open by running
+// `gh pr view`. Returns true on any error (fail-open) to avoid
+// dropping legitimate batches on transient failures.
+func (p *CIPoller) isPROpen(
+	ctx context.Context, ghRepo string, prNumber int,
+) bool {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view",
+		"--repo", ghRepo,
+		fmt.Sprintf("%d", prNumber),
+		"--json", "state",
+		"--jq", ".state",
+	)
+	if env := p.ghEnvForRepo(ghRepo); env != nil {
+		cmd.Env = env
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		// Fail-open: assume PR is open on errors
+		return true
+	}
+	return strings.TrimSpace(string(out)) == "OPEN"
 }
 
 // setCommitStatus posts a commit status check via the GitHub API.

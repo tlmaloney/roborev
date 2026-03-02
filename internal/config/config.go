@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/roborev-dev/roborev/internal/git"
@@ -230,6 +231,12 @@ func (c *GitHubAppConfig) GitHubAppPrivateKeyResolved() (string, error) {
 	return string(data), nil
 }
 
+// AgentReviewType pairs an agent name with a review type for the review matrix.
+type AgentReviewType struct {
+	Agent      string
+	ReviewType string
+}
+
 // CIConfig holds configuration for the CI poller that watches GitHub PRs
 type CIConfig struct {
 	// Enabled enables the CI poller
@@ -258,12 +265,31 @@ type CIConfig struct {
 	// Defaults to auto-detection if empty.
 	Agents []string `toml:"agents"`
 
+	// Reviews maps agent names to review type lists. When set, replaces
+	// the ReviewTypes x Agents cross-product with a granular matrix.
+	// Example: {"codex": ["security", "review"], "gemini": ["review"]}
+	Reviews map[string][]string `toml:"reviews"`
+
+	// ThrottleInterval is the minimum time between reviews of the same PR.
+	// If a PR was reviewed within this interval, new pushes are deferred.
+	// Default: "1h". Set to "0" to disable throttling.
+	ThrottleInterval string `toml:"throttle_interval"`
+
+	// ThrottleBypassUsers is a list of GitHub usernames whose PRs
+	// bypass the throttle interval and are always reviewed immediately.
+	ThrottleBypassUsers []string `toml:"throttle_bypass_users"`
+
 	// Model overrides the model for CI reviews (empty = use workflow resolution)
 	Model string `toml:"model"`
 
 	// SynthesisAgent is the agent used to synthesize multiple review outputs into one comment.
 	// Defaults to the first available agent.
 	SynthesisAgent string `toml:"synthesis_agent"`
+
+	// SynthesisBackupAgent is tried when the primary synthesis
+	// agent fails. Empty means no backup — failures fall through
+	// to raw formatting.
+	SynthesisBackupAgent string `toml:"synthesis_backup_agent"`
 
 	// SynthesisModel overrides the model used for synthesis.
 	SynthesisModel string `toml:"synthesis_model"`
@@ -292,6 +318,99 @@ func (c *CIConfig) ResolvedAgents() []string {
 		return c.Agents
 	}
 	return []string{""}
+}
+
+// ResolvedReviewMatrix returns (agent, reviewType) pairs.
+// If Reviews is set, uses it directly. Otherwise falls back to
+// the cross-product of ResolvedAgents() x ResolvedReviewTypes().
+func (c *CIConfig) ResolvedReviewMatrix() []AgentReviewType {
+	if len(c.Reviews) > 0 {
+		return reviewsMapToMatrix(c.Reviews)
+	}
+	agents := c.ResolvedAgents()
+	reviewTypes := c.ResolvedReviewTypes()
+	matrix := make(
+		[]AgentReviewType, 0, len(agents)*len(reviewTypes),
+	)
+	for _, rt := range reviewTypes {
+		for _, ag := range agents {
+			matrix = append(matrix, AgentReviewType{
+				Agent:      ag,
+				ReviewType: rt,
+			})
+		}
+	}
+	return matrix
+}
+
+// ResolvedReviewMatrixForRepo returns the review matrix for a RepoCIConfig.
+// If Reviews is set, uses it directly. Otherwise falls back to
+// the cross-product of Agents x ReviewTypes (which may be empty,
+// meaning "use global").
+func (c *RepoCIConfig) ResolvedReviewMatrix() []AgentReviewType {
+	if c.Reviews != nil {
+		// Reviews map is configured — return the resolved matrix
+		// even when empty (signals "disable reviews for this repo").
+		m := reviewsMapToMatrix(c.Reviews)
+		if m == nil {
+			return []AgentReviewType{}
+		}
+		return m
+	}
+	return nil
+}
+
+// reviewsMapToMatrix converts a Reviews map to a sorted slice of
+// AgentReviewType pairs. Agents are sorted alphabetically; review
+// types preserve their declared order within each agent.
+func reviewsMapToMatrix(
+	reviews map[string][]string,
+) []AgentReviewType {
+	agents := make([]string, 0, len(reviews))
+	for agent := range reviews {
+		agents = append(agents, agent)
+	}
+	slices.Sort(agents)
+
+	var matrix []AgentReviewType
+	for _, agent := range agents {
+		for _, rt := range reviews[agent] {
+			matrix = append(matrix, AgentReviewType{
+				Agent:      agent,
+				ReviewType: rt,
+			})
+		}
+	}
+	return matrix
+}
+
+// ResolvedThrottleInterval returns the minimum time between reviews
+// of the same PR. Defaults to 1h if empty or unparseable.
+// Returns 0 (disabled) if explicitly set to "0".
+func (c *CIConfig) ResolvedThrottleInterval() time.Duration {
+	if c.ThrottleInterval == "" {
+		return time.Hour
+	}
+	if c.ThrottleInterval == "0" {
+		return 0
+	}
+	d, err := time.ParseDuration(c.ThrottleInterval)
+	if err != nil || d < 0 {
+		return time.Hour
+	}
+	return d
+}
+
+// IsThrottleBypassed reports whether the given GitHub login is in
+// the ThrottleBypassUsers list. Comparison is case-insensitive.
+func (c *CIConfig) IsThrottleBypassed(login string) bool {
+	lower := strings.ToLower(login)
+	for _, u := range c.ThrottleBypassUsers {
+		if strings.ToLower(u) == lower {
+			return true
+		}
+	}
+	return false
 }
 
 // ResolvedMaxRepos returns the maximum number of repos to poll.
@@ -386,6 +505,10 @@ type RepoCIConfig struct {
 	// ReviewTypes overrides the list of review types for CI reviews of this repo.
 	ReviewTypes []string `toml:"review_types"`
 
+	// Reviews maps agent names to review type lists. When set, replaces
+	// the ReviewTypes x Agents cross-product for this repo.
+	Reviews map[string][]string `toml:"reviews"`
+
 	// Reasoning overrides the reasoning level for CI reviews (thorough, standard, fast).
 	Reasoning string `toml:"reasoning"`
 
@@ -468,7 +591,7 @@ type RepoConfig struct {
 
 // DefaultConfig returns the default configuration
 func DefaultConfig() *Config {
-	return &Config{
+	cfg := &Config{
 		ServerAddr:         "127.0.0.1:7373",
 		MaxWorkers:         4,
 		ReviewContextCount: 3,
@@ -478,6 +601,10 @@ func DefaultConfig() *Config {
 		ClaudeCodeCmd:      "claude",
 		CursorCmd:          "agent",
 	}
+	cfg.CI.ThrottleBypassUsers = []string{
+		"wesm", "mariusvniekerk",
+	}
+	return cfg
 }
 
 // DataDir returns the roborev data directory.
