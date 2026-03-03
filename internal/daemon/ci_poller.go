@@ -20,6 +20,7 @@ import (
 	"github.com/roborev-dev/roborev/internal/agent"
 	"github.com/roborev-dev/roborev/internal/config"
 	gitpkg "github.com/roborev-dev/roborev/internal/git"
+	ghpkg "github.com/roborev-dev/roborev/internal/github"
 	reviewpkg "github.com/roborev-dev/roborev/internal/review"
 	"github.com/roborev-dev/roborev/internal/storage"
 )
@@ -1648,28 +1649,30 @@ func formatPRComment(review *storage.Review, verdict string) string {
 	return b.String()
 }
 
-// postPRComment posts a comment on a GitHub PR using the gh CLI.
-// Truncates the body to stay within GitHub's ~65536 character limit.
+// postPRComment posts a roborev comment on a GitHub PR.
+// When upsert_comments is enabled (per-repo > global > false),
+// it finds and patches an existing marker comment; otherwise it
+// always creates a new comment.
 func (p *CIPoller) postPRComment(ghRepo string, prNumber int, body string) error {
-	if len(body) > reviewpkg.MaxCommentLen {
-		body = body[:reviewpkg.MaxCommentLen] +
-			"\n\n...(truncated — comment exceeded " +
-			"size limit)"
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "gh", "pr", "comment",
-		"--repo", ghRepo,
-		fmt.Sprintf("%d", prNumber),
-		"--body-file", "-",
-	)
-	cmd.Stdin = strings.NewReader(body)
-	if env := p.ghEnvForRepo(ghRepo); env != nil {
-		cmd.Env = env
+	env := p.ghEnvForRepo(ghRepo)
+	if p.resolveUpsertComments(ghRepo) {
+		return ghpkg.UpsertPRComment(ctx, ghRepo, prNumber, body, env)
 	}
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("gh pr comment: %s: %s", err, string(out))
+	return ghpkg.CreatePRComment(ctx, ghRepo, prNumber, body, env)
+}
+
+// resolveUpsertComments determines whether to upsert PR comments
+// for the given repo. Per-repo config takes priority over global.
+func (p *CIPoller) resolveUpsertComments(ghRepo string) bool {
+	repo, err := p.findLocalRepo(ghRepo)
+	if err == nil && repo != nil {
+		repoCfg, err := loadCIRepoConfig(repo.RootPath)
+		if err == nil && repoCfg != nil &&
+			repoCfg.CI.UpsertComments != nil {
+			return *repoCfg.CI.UpsertComments
+		}
 	}
-	return nil
+	return p.cfgGetter.Config().CI.UpsertComments
 }

@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 
 	"github.com/roborev-dev/roborev/internal/config"
 	"github.com/roborev-dev/roborev/internal/git"
+	ghpkg "github.com/roborev-dev/roborev/internal/github"
 	"github.com/roborev-dev/roborev/internal/review"
 	"github.com/spf13/cobra"
 )
@@ -264,8 +264,10 @@ func runCIReview(ctx context.Context, opts ciReviewOpts) error {
 			prNumber = detected
 		}
 
+		upsert := resolveCIUpsertComments(
+			repoCfg, globalCfg)
 		if err := postCIComment(
-			ghRepo, prNumber, comment,
+			ctx, ghRepo, prNumber, comment, upsert,
 		); err != nil {
 			return fmt.Errorf(
 				"post PR comment: %w", err)
@@ -380,6 +382,21 @@ func resolveCISynthesisAgent(
 	return ""
 }
 
+// resolveCIUpsertComments determines whether to upsert PR comments.
+// Priority: repo config > global config > false.
+func resolveCIUpsertComments(
+	repoCfg *config.RepoConfig,
+	globalCfg *config.Config,
+) bool {
+	if repoCfg != nil && repoCfg.CI.UpsertComments != nil {
+		return *repoCfg.CI.UpsertComments
+	}
+	if globalCfg != nil {
+		return globalCfg.CI.UpsertComments
+	}
+	return false
+}
+
 func splitTrimmed(s string) []string {
 	parts := strings.Split(s, ",")
 	out := make([]string, 0, len(parts))
@@ -477,30 +494,18 @@ func extractHeadSHA(gitRef string) string {
 	return gitRef
 }
 
-// postCIComment posts a comment on a GitHub PR using gh CLI.
-// Truncates the body to stay within GitHub's comment limit.
+// postCIComment posts a roborev comment on a GitHub PR.
+// When upsert is true, it finds and patches an existing marker comment;
+// otherwise it always creates a new comment.
 func postCIComment(
+	ctx context.Context,
 	ghRepo string,
 	prNumber int,
 	body string,
+	upsert bool,
 ) error {
-	if len(body) > review.MaxCommentLen {
-		body = body[:review.MaxCommentLen] +
-			"\n\n...(truncated — comment exceeded " +
-			"size limit)"
+	if upsert {
+		return ghpkg.UpsertPRComment(ctx, ghRepo, prNumber, body, nil)
 	}
-
-	ghCmd := exec.Command("gh", "pr", "comment",
-		"--repo", ghRepo,
-		strconv.Itoa(prNumber),
-		"--body-file", "-")
-	ghCmd.Stdin = strings.NewReader(body)
-	ghCmd.Stderr = os.Stderr
-
-	if out, err := ghCmd.Output(); err != nil {
-		return fmt.Errorf(
-			"gh pr comment: %v (output: %s)",
-			err, string(out))
-	}
-	return nil
+	return ghpkg.CreatePRComment(ctx, ghRepo, prNumber, body, nil)
 }

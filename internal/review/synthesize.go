@@ -102,9 +102,10 @@ func formatSingleResult(
 	}
 
 	output := r.Output
+	const truncSuffix = "\n\n...(truncated)"
+	maxLen := MaxCommentLen - len(truncSuffix)
 	if len(output) > MaxCommentLen {
-		output = output[:MaxCommentLen] +
-			"\n\n...(truncated)"
+		output = TrimPartialRune(output[:maxLen]) + truncSuffix
 	}
 
 	return header + output + fmt.Sprintf(
