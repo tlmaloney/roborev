@@ -127,12 +127,32 @@ type ReviewContext struct {
 
 // Builder constructs review prompts
 type Builder struct {
-	db *storage.DB
+	db        *storage.DB
+	globalCfg *config.Config // optional global config for exclude patterns
 }
 
 // NewBuilder creates a new prompt builder
 func NewBuilder(db *storage.DB) *Builder {
 	return &Builder{db: db}
+}
+
+// NewBuilderWithConfig creates a prompt builder that also resolves
+// global config settings (e.g., exclude_patterns).
+func NewBuilderWithConfig(
+	db *storage.DB, globalCfg *config.Config,
+) *Builder {
+	return &Builder{db: db, globalCfg: globalCfg}
+}
+
+// resolveExcludes returns the merged exclude patterns for a repo.
+// Security reviews skip repo-level patterns to prevent a compromised
+// default branch from hiding files from review.
+func (b *Builder) resolveExcludes(
+	repoPath, reviewType string,
+) []string {
+	return config.ResolveExcludePatterns(
+		repoPath, b.globalCfg, reviewType,
+	)
 }
 
 // Build constructs a review prompt for a commit or range with context from previous reviews.
@@ -263,7 +283,7 @@ func (b *Builder) buildSinglePrompt(repoPath, sha string, repoID int64, contextC
 	sb.WriteString("\n")
 
 	// Get and include the diff
-	diff, err := git.GetDiff(repoPath, sha)
+	diff, err := git.GetDiff(repoPath, sha, b.resolveExcludes(repoPath, reviewType)...)
 	if err != nil {
 		return "", fmt.Errorf("get diff: %w", err)
 	}
@@ -345,7 +365,7 @@ func (b *Builder) buildRangePrompt(repoPath, rangeRef string, repoID int64, cont
 	sb.WriteString("\n")
 
 	// Get and include the combined diff for the range
-	diff, err := git.GetRangeDiff(repoPath, rangeRef)
+	diff, err := git.GetRangeDiff(repoPath, rangeRef, b.resolveExcludes(repoPath, reviewType)...)
 	if err != nil {
 		return "", fmt.Errorf("get range diff: %w", err)
 	}
@@ -646,7 +666,13 @@ func (b *Builder) BuildAddressPrompt(repoPath string, review *storage.Review, pr
 	sb.WriteString(review.Output)
 	sb.WriteString("\n\n")
 
-	// Include the original diff for context if we have job info
+	// Include the original diff for context if we have job info.
+	// Don't apply user exclude patterns — the diff should match
+	// what the original review saw so findings stay relevant.
+	// Built-in lockfile excludes still apply (hardcoded in GetDiff).
+	// Tradeoff: without user excludes the diff may be larger and
+	// trip the MaxPromptSize/2 guard, but that's a soft degradation
+	// vs hiding the exact file the findings reference.
 	if review.Job != nil && review.Job.GitRef != "" && review.Job.GitRef != "dirty" {
 		diff, err := git.GetDiff(repoPath, review.Job.GitRef)
 		if err == nil && len(diff) > 0 && len(diff) < MaxPromptSize/2 {

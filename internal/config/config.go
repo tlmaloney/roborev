@@ -138,6 +138,9 @@ type Config struct {
 	// CI poller configuration
 	CI CIConfig `toml:"ci"`
 
+	// Diff exclusion patterns (filenames or glob patterns to exclude from review diffs)
+	ExcludePatterns []string `toml:"exclude_patterns" comment:"Filenames or glob patterns to exclude from review diffs globally."`
+
 	// Analysis settings
 	DefaultMaxPromptSize int `toml:"default_max_prompt_size"` // Max prompt size in bytes before falling back to paths (default: 200KB)
 
@@ -565,7 +568,8 @@ type RepoConfig struct {
 	FixReasoning               string   `toml:"fix_reasoning" comment:"Reasoning level for fix in this repo: fast, standard, or thorough."`           // Reasoning level for fix: thorough, standard, fast
 	FixMinSeverity             string   `toml:"fix_min_severity" comment:"Minimum severity for fix in this repo: critical, high, medium, or low."`    // Minimum severity for fix: critical, high, medium, low
 	RefineMinSeverity          string   `toml:"refine_min_severity" comment:"Minimum severity for refine in this repo: critical, high, medium, low."` // Minimum severity for refine: critical, high, medium, low
-	PostCommitReview           string   `toml:"post_commit_review" comment:"Automatic post-commit review mode for this repo: commit or branch."`      // "commit" (default) or "branch"
+	ExcludePatterns            []string `toml:"exclude_patterns" comment:"Filenames or glob patterns to exclude from review diffs for this repo."`
+	PostCommitReview           string   `toml:"post_commit_review" comment:"Automatic post-commit review mode for this repo: commit or branch."` // "commit" (default) or "branch"
 	ReuseReviewSession         *bool    `toml:"reuse_review_session"`
 	ReuseReviewSessionLookback int      `toml:"reuse_review_session_lookback"` // 0 means no candidate cap
 
@@ -859,6 +863,97 @@ func ResolveJobTimeout(repoPath string, globalCfg *Config) int {
 		globalVal = clampPositive(globalCfg.JobTimeoutMinutes)
 	}
 	return resolve(30, repoVal, globalVal)
+}
+
+// ResolveExcludePatterns returns the merged exclude patterns from
+// repo config and global config. Repo patterns are read from the
+// default branch (like review guidelines) to prevent untrusted
+// branches from suppressing files in reviews. Falls back to the
+// filesystem config only when no default branch config exists.
+// Global patterns are appended after repo patterns (deduplicated).
+//
+// Security reviews skip repo-level patterns entirely so a
+// compromised default branch cannot suppress files from review.
+func ResolveExcludePatterns(
+	repoPath string, globalCfg *Config, reviewType string,
+) []string {
+	var repo []string
+	if reviewType != "security" {
+		repo = loadRepoExcludePatterns(repoPath)
+	}
+	var global []string
+	if globalCfg != nil {
+		global = globalCfg.ExcludePatterns
+	}
+	if len(repo) == 0 && len(global) == 0 {
+		return nil
+	}
+	return mergePatterns(repo, global)
+}
+
+// ResolveExcludePatternsLocal is like ResolveExcludePatterns but
+// reads repo config from the working tree instead of the default
+// branch. Use this for dirty reviews where the user is reviewing
+// local changes and expects local config to apply.
+func ResolveExcludePatternsLocal(
+	repoPath string, globalCfg *Config, reviewType string,
+) []string {
+	var repo []string
+	if reviewType != "security" {
+		if fsCfg, err := LoadRepoConfig(repoPath); err == nil && fsCfg != nil {
+			repo = fsCfg.ExcludePatterns
+		}
+	}
+	var global []string
+	if globalCfg != nil {
+		global = globalCfg.ExcludePatterns
+	}
+	if len(repo) == 0 && len(global) == 0 {
+		return nil
+	}
+	return mergePatterns(repo, global)
+}
+
+// loadRepoExcludePatterns reads exclude_patterns from the default
+// branch's .roborev.toml, falling back to the filesystem config
+// when no default branch config exists (e.g., no remote, or
+// .roborev.toml not yet committed). This mirrors loadGuidelines
+// to prevent untrusted branches from controlling review scope.
+func loadRepoExcludePatterns(repoPath string) []string {
+	if defaultBranch, err := git.GetDefaultBranch(repoPath); err == nil {
+		cfg, err := LoadRepoConfigFromRef(repoPath, defaultBranch)
+		if err != nil {
+			if IsConfigParseError(err) {
+				return nil
+			}
+			// Fall through to filesystem
+		} else if cfg != nil {
+			return cfg.ExcludePatterns
+		}
+	}
+	if fsCfg, err := LoadRepoConfig(repoPath); err == nil && fsCfg != nil {
+		return fsCfg.ExcludePatterns
+	}
+	return nil
+}
+
+func mergePatterns(a, b []string) []string {
+	seen := make(map[string]struct{}, len(a)+len(b))
+	merged := make([]string, 0, len(a)+len(b))
+	for _, list := range [2][]string{a, b} {
+		for _, p := range list {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			merged = append(merged, p)
+		}
+	}
+	return merged
 }
 
 // IsBranchExcluded checks if a branch should be excluded from reviews

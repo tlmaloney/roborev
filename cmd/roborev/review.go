@@ -227,8 +227,14 @@ Examples:
 					return fmt.Errorf("no uncommitted changes to review")
 				}
 
-				// Generate dirty diff (includes untracked files)
-				diffContent, err = git.GetDirtyDiff(root)
+				// Generate dirty diff (includes untracked files).
+				// Use working-tree repo config (not default branch) for
+				// dirty reviews so local exclude_patterns changes apply.
+				globalCfg, _ := config.LoadGlobal()
+				excludes := config.ResolveExcludePatternsLocal(
+					root, globalCfg, reviewType,
+				)
+				diffContent, err = git.GetDirtyDiff(root, excludes...)
 				if err != nil {
 					return fmt.Errorf("get dirty diff: %w", err)
 				}
@@ -413,12 +419,13 @@ func runLocalReview(cmd *cobra.Command, repoPath, gitRef, diffContent, agentName
 	}
 
 	// Build prompt
+	pb := prompt.NewBuilderWithConfig(nil, cfg)
 	var reviewPrompt string
 	if diffContent != "" {
 		// Dirty review
-		reviewPrompt, err = prompt.NewBuilder(nil).BuildDirty(repoPath, diffContent, 0, cfg.ReviewContextCount, a.Name(), reviewType)
+		reviewPrompt, err = pb.BuildDirty(repoPath, diffContent, 0, cfg.ReviewContextCount, a.Name(), reviewType)
 	} else {
-		reviewPrompt, err = prompt.NewBuilder(nil).Build(repoPath, gitRef, 0, cfg.ReviewContextCount, a.Name(), reviewType)
+		reviewPrompt, err = pb.Build(repoPath, gitRef, 0, cfg.ReviewContextCount, a.Name(), reviewType)
 	}
 	if err != nil {
 		return fmt.Errorf("build prompt: %w", err)
