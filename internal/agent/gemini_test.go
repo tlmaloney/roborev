@@ -44,20 +44,22 @@ func TestGeminiBuildArgs(t *testing.T) {
 			agentic: false,
 			wantArgPairs: map[string]string{
 				"--output-format": "stream-json",
-				"--allowed-tools": "Read,Glob,Grep",
+				"--approval-mode": "plan",
 			},
 			unwantedArgs: []string{
 				"--yolo",
-				"Edit", "Write", "Bash", "Shell",
+				"--allowed-tools",
 			},
 		},
 		{
-			name:      "AgenticMode",
-			agentic:   true,
-			wantFlags: []string{"--yolo"},
+			name:    "AgenticMode",
+			agentic: true,
 			wantArgPairs: map[string]string{
 				"--output-format": "stream-json",
-				"--allowed-tools": "Edit,Write,Read,Glob,Grep,Bash,Shell",
+				"--approval-mode": "yolo",
+			},
+			unwantedArgs: []string{
+				"--allowed-tools",
 			},
 		},
 	}
@@ -352,6 +354,124 @@ exit 1
 			require.NoError(err)
 			assert.Equal(tc.wantResult, res)
 		})
+	}
+}
+
+func TestGeminiReview_ModelNotFoundFallback(t *testing.T) {
+	skipIfWindows(t)
+
+	// Script that fails with "model not found" when -m is passed,
+	// and succeeds without it (simulating a retired default model).
+	scriptPath := writeTempCommand(t, `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "-m" ]; then
+    echo "Error: model is not found for API version v1" >&2
+    exit 1
+  fi
+done
+echo '{"type":"result","result":"Review from default model"}'
+`)
+
+	a := NewGeminiAgent(scriptPath)
+	var output bytes.Buffer
+	res, err := a.Review(
+		context.Background(), t.TempDir(), "sha", "prompt", &output,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "Review from default model", res)
+}
+
+func TestGeminiReview_ModelNotFoundLateStderr(t *testing.T) {
+	skipIfWindows(t)
+
+	// Regression: stderr emitted only at exit (after stdout closes).
+	// Previously stderrStr was read before cmd.Wait(), racing with
+	// the goroutine writing stderr.
+	scriptPath := writeTempCommand(t, `#!/bin/sh
+echo '{"type":"system","subtype":"init"}'
+# Close stdout before writing stderr, simulating late error output.
+exec 1>&-
+sleep 0.05
+echo "Error: model is not found for API version v1" >&2
+exit 1
+`)
+
+	a := NewGeminiAgent(scriptPath)
+	var output bytes.Buffer
+	// The retry (without -m) will also fail since the script always
+	// exits 1, but the important thing is that stderr is captured
+	// correctly and the model-not-found detection triggers the retry.
+	_, err := a.Review(
+		context.Background(), t.TempDir(), "sha", "prompt", &output,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "gemini failed",
+		"should fail on retry but not panic or lose stderr")
+}
+
+func TestGeminiReview_ModelNotFoundNoRetryWhenNoModel(t *testing.T) {
+	skipIfWindows(t)
+
+	// When Model is empty, don't retry on model-not-found.
+	scriptPath := writeTempCommand(t, `#!/bin/sh
+echo "Error: model is not found" >&2
+exit 1
+`)
+
+	a := NewGeminiAgent(scriptPath)
+	a.Model = ""
+	var output bytes.Buffer
+	_, err := a.Review(
+		context.Background(), t.TempDir(), "sha", "prompt", &output,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "gemini failed")
+}
+
+func TestGeminiReview_ExplicitModelNoFallback(t *testing.T) {
+	skipIfWindows(t)
+
+	// When the model is not the built-in default, model-not-found
+	// errors should fail fast with exactly one invocation.
+	counterFile := filepath.Join(t.TempDir(), "invocations")
+	scriptPath := writeTempCommand(t, `#!/bin/sh
+echo "invoked" >> "$COUNTER_FILE"
+echo "Error: model is not found for API version v1" >&2
+exit 1
+`)
+
+	t.Setenv("COUNTER_FILE", counterFile)
+	a := NewGeminiAgent(scriptPath).WithModel("user-specified-model")
+	var output bytes.Buffer
+	_, err := a.Review(
+		context.Background(), t.TempDir(), "sha", "prompt", &output,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "gemini failed")
+
+	countBytes, readErr := os.ReadFile(counterFile)
+	require.NoError(t, readErr)
+	lines := strings.Count(string(countBytes), "invoked")
+	assert.Equal(t, 1, lines,
+		"explicit model should invoke exactly once, not retry")
+}
+
+func TestIsModelNotFoundError(t *testing.T) {
+	tests := []struct {
+		stderr string
+		want   bool
+	}{
+		{"models/gemini-3.1-pro is not found", true},
+		{"Error: model is not found for API version v1", true},
+		{"Model not found: gemini-old", true},
+		{"NOT_FOUND: model gemini-xyz not_found", true},
+		{"quota exceeded for model gemini-2.5-pro", false},
+		{"connection refused", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		got := isModelNotFoundError(tc.stderr)
+		assert.Equal(t, tc.want, got, "isModelNotFoundError(%q)", tc.stderr)
 	}
 }
 
